@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f2a2e">
+<meta name="color-scheme" content="dark">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<title>Thump Metronome</title>
+<style>
+  :root {
+    --bg: #0f2a2e;
+    --surface: #17393f;
+    --line: #2b5961;
+    --text: #e6f0ee;
+    --muted: #8fb0ac;
+    --accent: #f2b544;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: ui-rounded, "SF Pro Rounded", system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: flex;
+    justify-content: center;
+    padding: env(safe-area-inset-top) 1.5rem env(safe-area-inset-bottom);
+  }
+  main {
+    width: 100%;
+    max-width: 26rem;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 2rem;
+    padding: 1.5rem 0;
+  }
+  .tempo { display: flex; align-items: center; justify-content: space-between; }
+  .tempo output {
+    font-size: 5rem;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+    text-align: center;
+    flex: 1;
+  }
+  .tempo small { display: block; font-size: 1rem; font-weight: 400; color: var(--muted); margin-top: 0.4rem; }
+  .step {
+    width: 3.5rem; height: 3.5rem;
+    border-radius: 50%;
+    border: 1px solid var(--line);
+    background: transparent;
+    color: var(--text);
+    font-size: 1.75rem;
+    cursor: pointer;
+  }
+  .step:active { background: var(--surface); }
+  #toggle {
+    align-self: center;
+    width: 11rem; height: 11rem;
+    border-radius: 50%;
+    border: 2px solid var(--accent);
+    background: var(--surface);
+    color: var(--accent);
+    font: inherit;
+    font-size: 1.5rem;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  #toggle[aria-pressed="true"] { background: var(--accent); color: var(--bg); }
+  .listen { display: flex; flex-direction: column; align-items: center; gap: 0.75rem; }
+  #listen {
+    height: 3rem;
+    padding: 0 1.5rem;
+    border-radius: 1.5rem;
+    border: 1px solid var(--line);
+    background: transparent;
+    color: var(--text);
+    font: inherit;
+    cursor: pointer;
+  }
+  #listen:active { background: var(--surface); }
+  button:disabled { opacity: 0.5; cursor: default; }
+  #status { margin: 0; min-height: 1.5rem; color: var(--muted); text-align: center; }
+  label { display: grid; grid-template-columns: 1fr auto; row-gap: 0.5rem; color: var(--muted); }
+  label output { color: var(--text); font-variant-numeric: tabular-nums; }
+  label input { grid-column: 1 / -1; }
+  input[type="range"] { width: 100%; height: 2rem; accent-color: var(--accent); }
+  button:focus-visible, input:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+</style>
+</head>
+<body>
+<main>
+  <section class="tempo">
+    <button class="step" id="bpm-down" aria-label="Decrease tempo">−</button>
+    <output id="bpm-out" for="bpm">90<small>BPM</small></output>
+    <button class="step" id="bpm-up" aria-label="Increase tempo">+</button>
+  </section>
+
+  <button id="toggle" aria-pressed="false">Start</button>
+
+  <div class="listen">
+    <button id="listen">Listen for tempo</button>
+    <p id="status" role="status"></p>
+  </div>
+
+  <label>Tempo
+    <output id="bpm-label" for="bpm">90 BPM</output>
+    <input id="bpm" type="range" min="20" max="300" step="1" value="90">
+  </label>
+  <label>Pitch
+    <output id="freq-out" for="freq">55 Hz</output>
+    <input id="freq" type="range" min="30" max="400" step="1" value="55">
+  </label>
+  <label>Volume
+    <output id="amp-out" for="amp">80 %</output>
+    <input id="amp" type="range" min="0" max="100" step="1" value="80">
+  </label>
+</main>
+
+<script type="module">
+  import { estimateTempo } from './tempo.js';
+
+  const $ = (id) => document.getElementById(id);
+  const bpmEl = $('bpm'), freqEl = $('freq'), ampEl = $('amp');
+  const toggleEl = $('toggle'), pulseEl = toggleEl;
+  const listenEl = $('listen'), statusEl = $('status');
+  const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
+
+  const LOOKAHEAD_S = 0.15;
+  const TICK_MS = 25;
+  const BPM_MIN = 20, BPM_MAX = 300;
+  const LISTEN_S = 8;
+  // Thresholds tuned on synthetic signals only; not validated on real recordings.
+  const MIN_CONFIDENCE = 0.2;
+  const MIN_PULSINESS = 0.025;
+
+  // Forwards raw mic blocks to the main thread for offline analysis.
+  const TAP_WORKLET = `
+    class Tap extends AudioWorkletProcessor {
+      process(inputs) {
+        const ch = inputs[0][0];
+        if (ch) this.port.postMessage(ch.slice());
+        return true;
+      }
+    }
+    registerProcessor('tap', Tap);
+  `;
+
+  let ctx = null;
+  let master = null;
+  let timer = null;
+  let nextTime = 0;
+  let workletReady = false;
+  const pending = [];
+
+  const ampGain = () => (ampEl.value / 100) ** 2;
+
+  function renderLabels() {
+    $('bpm-out').firstChild.nodeValue = bpmEl.value;
+    $('bpm-label').textContent = `${bpmEl.value} BPM`;
+    $('freq-out').textContent = `${freqEl.value} Hz`;
+    $('amp-out').textContent = `${ampEl.value} %`;
+  }
+
+  // Sine with a fast downward pitch sweep and exponential decay: a soft, round thump.
+  function playBeat(time) {
+    const f = Number(freqEl.value);
+    const osc = ctx.createOscillator();
+    const env = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(f * 2.5, time);
+    osc.frequency.exponentialRampToValueAtTime(f, time + 0.05);
+    env.gain.setValueAtTime(0.0001, time);
+    env.gain.linearRampToValueAtTime(1, time + 0.004);
+    env.gain.exponentialRampToValueAtTime(0.0001, time + 0.4);
+    osc.connect(env).connect(master);
+    osc.start(time);
+    osc.stop(time + 0.45);
+  }
+
+  function schedule() {
+    while (nextTime < ctx.currentTime + LOOKAHEAD_S) {
+      playBeat(nextTime);
+      pending.push(nextTime);
+      nextTime += 60 / Number(bpmEl.value);
+    }
+  }
+
+  function pulse() {
+    if (reducedMotion.matches) return;
+    pulseEl.animate(
+      [{ transform: 'scale(1.06)' }, { transform: 'scale(1)' }],
+      { duration: 220, easing: 'ease-out' }
+    );
+  }
+
+  function frame() {
+    if (timer === null) return;
+    while (pending.length && pending[0] <= ctx.currentTime) {
+      pending.shift();
+      pulse();
+    }
+    requestAnimationFrame(frame);
+  }
+
+  function ensureContext() {
+    if (ctx) return;
+    ctx = new AudioContext();
+    master = ctx.createGain();
+    master.gain.value = ampGain();
+    master.connect(ctx.destination);
+  }
+
+  async function start() {
+    ensureContext();
+    await ctx.resume();
+    nextTime = ctx.currentTime + 0.05;
+    schedule();
+    timer = setInterval(schedule, TICK_MS);
+    requestAnimationFrame(frame);
+  }
+
+  function stop() {
+    clearInterval(timer);
+    timer = null;
+    pending.length = 0;
+  }
+
+  function renderToggle() {
+    const running = timer !== null;
+    toggleEl.setAttribute('aria-pressed', String(running));
+    toggleEl.textContent = running ? 'Stop' : 'Start';
+  }
+
+  // Records seconds of raw mic audio. Echo cancellation, noise suppression and AGC are
+  // disabled because they distort the transients the tempo estimate depends on.
+  async function capture(seconds) {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1 },
+    });
+    try {
+      if (!workletReady) {
+        const url = URL.createObjectURL(new Blob([TAP_WORKLET], { type: 'text/javascript' }));
+        await ctx.audioWorklet.addModule(url);
+        URL.revokeObjectURL(url);
+        workletReady = true;
+      }
+      const source = ctx.createMediaStreamSource(stream);
+      const tap = new AudioWorkletNode(ctx, 'tap', { channelCount: 1, channelCountMode: 'explicit' });
+      const chunks = [];
+      let total = 0;
+      const target = Math.round(seconds * ctx.sampleRate);
+      await new Promise((resolve) => {
+        tap.port.onmessage = (e) => {
+          chunks.push(e.data);
+          total += e.data.length;
+          statusEl.textContent = `Listening… ${Math.max(0, Math.ceil(seconds - total / ctx.sampleRate))} s`;
+          if (total >= target) resolve();
+        };
+        source.connect(tap);
+        tap.connect(ctx.destination);
+      });
+      source.disconnect();
+      tap.disconnect();
+      tap.port.onmessage = null;
+
+      const samples = new Float32Array(total);
+      let offset = 0;
+      for (const c of chunks) {
+        samples.set(c, offset);
+        offset += c.length;
+      }
+      return samples;
+    } finally {
+      stream.getTracks().forEach((t) => t.stop());
+    }
+  }
+
+  listenEl.addEventListener('click', async () => {
+    stop();
+    renderToggle();
+    listenEl.disabled = true;
+    toggleEl.disabled = true;
+    try {
+      if (!navigator.mediaDevices) throw new Error('microphone access requires HTTPS');
+      ensureContext();
+      await ctx.resume();
+      statusEl.textContent = `Listening… ${LISTEN_S} s`;
+      const result = estimateTempo(await capture(LISTEN_S), ctx.sampleRate);
+      if (!result || result.confidence < MIN_CONFIDENCE || result.pulsiness < MIN_PULSINESS) {
+        statusEl.textContent = 'No steady beat found';
+      } else {
+        bpmEl.value = Math.round(result.bpm);
+        renderLabels();
+        statusEl.textContent = `Detected ${bpmEl.value} BPM`;
+      }
+    } catch (err) {
+      statusEl.textContent = err.name === 'NotAllowedError'
+        ? 'Microphone access denied'
+        : `Listening failed: ${err.message}`;
+    } finally {
+      listenEl.disabled = false;
+      toggleEl.disabled = false;
+    }
+  });
+
+  toggleEl.addEventListener('click', async () => {
+    if (timer === null) await start(); else stop();
+    renderToggle();
+  });
+
+  const stepBpm = (d) => {
+    bpmEl.value = Math.min(BPM_MAX, Math.max(BPM_MIN, Number(bpmEl.value) + d));
+    renderLabels();
+  };
+  $('bpm-down').addEventListener('click', () => stepBpm(-1));
+  $('bpm-up').addEventListener('click', () => stepBpm(1));
+
+  for (const el of [bpmEl, freqEl, ampEl]) el.addEventListener('input', renderLabels);
+  ampEl.addEventListener('input', () => {
+    if (master) master.gain.setTargetAtTime(ampGain(), ctx.currentTime, 0.01);
+  });
+
+  renderLabels();
+
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
+</script>
+</body>
+</html>
